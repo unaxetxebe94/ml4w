@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+"""Write an Omarchy colors.toml derived from a background image."""
+
+import colorsys
+import re
+import subprocess
+import sys
+
+ANCHORS = {
+    "red": (0.985, 0.74, 0.62),
+    "yellow": (0.130, 0.82, 0.66),
+    "green": (0.360, 0.60, 0.60),
+    "cyan": (0.500, 0.58, 0.62),
+    "blue": (0.600, 0.66, 0.70),
+    "magenta": (0.880, 0.64, 0.70),
+    "orange": (0.075, 0.78, 0.64),
+}
+
+ORDER = [
+    "mode",
+    "accent",
+    "selection",
+    "muted",
+    "background",
+    "dark_background",
+    "darker_background",
+    "lighter_background",
+    "foreground",
+    "dark_foreground",
+    "light_foreground",
+    "bright_foreground",
+    "red",
+    "yellow",
+    "orange",
+    "green",
+    "cyan",
+    "blue",
+    "magenta",
+    "brown",
+    "bright_red",
+    "bright_yellow",
+    "bright_green",
+    "bright_cyan",
+    "bright_blue",
+    "bright_magenta",
+]
+
+
+def clamp(value, low, high):
+    return max(low, min(high, value))
+
+
+def hsl(hue, saturation, lightness):
+    r, g, b = colorsys.hls_to_rgb(hue % 1.0, clamp(lightness, 0.0, 1.0), clamp(saturation, 0.0, 1.0))
+    return "#%02x%02x%02x" % (round(r * 255), round(g * 255), round(b * 255))
+
+
+def hex_to_hsl(value):
+    r, g, b = (int(value[i:i + 2], 16) / 255 for i in (0, 2, 4))
+    hue, lightness, saturation = colorsys.rgb_to_hls(r, g, b)
+    return hue, saturation, lightness
+
+
+def hue_delta(a, b):
+    return (a - b + 0.5) % 1.0 - 0.5
+
+
+def histogram(path):
+    result = subprocess.run(
+        [
+            "magick",
+            path,
+            "-auto-orient",
+            "-resize",
+            "96x96!",
+            "-depth",
+            "8",
+            "-colors",
+            "16",
+            "-format",
+            "%c",
+            "histogram:info:-",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    entries = []
+    for match in re.finditer(r"(\d+)\s*:\s*\([^)]*\)\s*#([0-9A-Fa-f]{6,8})", result):
+        entries.append((int(match.group(1)), match.group(2)[:6].upper()))
+    return entries
+
+
+def pick_source(entries):
+    total = sum(count for count, _ in entries) or 1
+    best = None
+    best_score = -1.0
+    for count, value in entries:
+        red, green, blue = (int(value[i:i + 2], 16) for i in (0, 2, 4))
+        chroma = (max(red, green, blue) - min(red, green, blue)) / 255
+        score = chroma * (count / total) ** 0.5
+        if score > best_score:
+            best_score = score
+            best = value
+    if best is None or best_score < 0.01:
+        return 0.58, 0.45, 0.55
+    return hex_to_hsl(best)
+
+
+def pick_tone(entries):
+    total = sum(count for count, _ in entries) or 1
+    mean_saturation = 0.0
+    mean_lightness = 0.0
+    for count, value in entries:
+        _, saturation, lightness = hex_to_hsl(value)
+        mean_saturation += count * saturation
+        mean_lightness += count * lightness
+    return mean_saturation / total, mean_lightness / total
+
+
+def build(hue, saturation, lightness, tone_saturation=None, tone_lightness=None):
+    hue = hue % 1.0
+    saturation = clamp(saturation, 0.10, 0.90)
+    if tone_saturation is None or tone_lightness is None:
+        tone_saturation, tone_lightness = saturation, lightness
+    background_saturation = clamp(saturation * 0.45, 0.10, 0.30)
+    text_saturation = clamp(saturation * 0.22, 0.06, 0.20)
+    accent_saturation = clamp(0.45 + saturation * 0.35, 0.45, 0.85)
+    accent_lightness = clamp(0.60 + lightness * 0.06, 0.58, 0.68)
+    wheel_shift = clamp(hue_delta(hue, 0.075), -0.15, 0.15)
+    tone_shift = clamp((tone_lightness - 0.45) * 0.35, -0.10, 0.10)
+    tone_saturation_shift = clamp((tone_saturation - 0.40) * 0.40, -0.12, 0.16)
+
+    palette = {
+        "mode": "dark",
+        "accent": hsl(hue, accent_saturation, accent_lightness),
+        "selection": hsl(hue, clamp(saturation * 0.30, 0.10, 0.26), 0.22),
+        "muted": hsl(hue, clamp(saturation * 0.20, 0.06, 0.18), 0.40),
+        "background": hsl(hue, background_saturation, 0.055),
+        "dark_background": hsl(hue, background_saturation * 0.9, 0.042),
+        "darker_background": hsl(hue, background_saturation * 0.8, 0.030),
+        "lighter_background": hsl(hue, background_saturation * 0.8, 0.135),
+        "foreground": hsl(hue, text_saturation, clamp(0.90 + tone_shift * 0.5, 0.86, 0.94)),
+        "dark_foreground": hsl(hue, text_saturation * 0.8, clamp(0.46 + tone_shift, 0.40, 0.56)),
+        "light_foreground": hsl(hue, text_saturation * 0.9, clamp(0.78 + tone_shift, 0.72, 0.86)),
+        "bright_foreground": hsl(hue, text_saturation * 0.8, clamp(0.97 + tone_shift * 0.3, 0.94, 0.99)),
+        "brown": hsl(hue + hue_delta(hue, 0.06) * 0.10, 0.45, 0.40),
+    }
+
+    for name, (anchor, base_saturation, base_lightness) in ANCHORS.items():
+        shifted = (anchor + wheel_shift + hue_delta(hue, anchor) * 0.10) % 1.0
+        color_saturation = clamp(
+            base_saturation + tone_saturation_shift + (saturation - 0.5) * 0.18, 0.45, 0.92
+        )
+        color_lightness = clamp(base_lightness + tone_shift, 0.35, 0.80)
+        palette[name] = hsl(shifted, color_saturation, color_lightness)
+        palette["bright_" + name] = hsl(shifted, color_saturation, min(color_lightness + 0.10, 0.84))
+
+    return palette
+
+
+def main():
+    if len(sys.argv) < 3:
+        print("usage: derive-colors <image> <output>", file=sys.stderr)
+        return 1
+
+    image, output = sys.argv[1], sys.argv[2]
+    entries = histogram(image)
+    palette = build(*pick_source(entries), *pick_tone(entries))
+
+    with open(output, "w") as handle:
+        for key in ORDER:
+            handle.write('%s = "%s"\n' % (key, palette[key]))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

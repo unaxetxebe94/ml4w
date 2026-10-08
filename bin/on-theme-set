@@ -1,0 +1,44 @@
+#!/bin/bash
+# theme-set and post-boot hook for the ML4W theme.
+
+set -u
+
+THEME_DIR="$HOME/.config/omarchy/themes/ml4w"
+STATE_DIR="$HOME/.local/state/omarchy"
+DEFAULT_FONT="JetBrainsMono Nerd Font"
+WANTED_FONT="FiraCode Nerd Font"
+FOOT_INI="$HOME/.config/foot/foot.ini"
+
+THEME="${1:-$(cat "$STATE_DIR/current/theme.name" 2>/dev/null)}"
+
+if [[ $THEME != ml4w ]]; then
+  "$THEME_DIR/bin/watch-bg" stop
+  if [[ $(omarchy font current 2>/dev/null) == "$WANTED_FONT" ]]; then
+    omarchy font set "$DEFAULT_FONT" >/dev/null 2>&1 || true
+  fi
+  exit 0
+fi
+
+if [[ ${OMARCHY_ML4W_APPLYING:-0} != 1 ]]; then
+  "$THEME_DIR/bin/apply-dynamic"
+fi
+
+FOOT_THEME_INI="$STATE_DIR/current/theme/foot.ini"
+if [[ -f $FOOT_THEME_INI ]]; then
+  sed -i -e '/^alpha=/d' -e '/^alpha-mode=/d' -e '/^blur=/d' \
+    -e '/^\[colors-dark\]/a alpha=0.7\nalpha-mode=all\nblur=yes' "$FOOT_THEME_INI"
+fi
+
+if fc-list | grep -Fqi -- "$WANTED_FONT"; then
+  current_font=$(omarchy font current 2>/dev/null)
+  if [[ $current_font == "$DEFAULT_FONT" ]]; then
+    omarchy font set "$WANTED_FONT" >/dev/null 2>&1 || true
+  fi
+fi
+
+if [[ $(omarchy font current 2>/dev/null) == "$WANTED_FONT" ]]; then
+  sed -i "s/^font=$WANTED_FONT:size=[0-9.]*/font=$WANTED_FONT:size=11/" "$FOOT_INI" 2>/dev/null || true
+fi
+
+"$THEME_DIR/bin/watch-bg" start
+exit 0

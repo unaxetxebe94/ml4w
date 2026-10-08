@@ -1,0 +1,46 @@
+#!/bin/bash
+# Derive colors.toml from a background and re-apply the theme when it changed.
+
+set -u
+
+THEME_DIR="$HOME/.config/omarchy/themes/ml4w"
+LOCK_FILE="$HOME/.cache/omarchy/ml4w-derive.lock"
+LOG_FILE="$HOME/.cache/omarchy/ml4w-derive.log"
+CURRENT_THEME="$HOME/.local/state/omarchy/current/theme"
+
+log() {
+  printf '%s %s\n' "$(date +%H:%M:%S)" "$*" >>"$LOG_FILE"
+}
+
+[[ $(cat "$HOME/.local/state/omarchy/current/theme.name" 2>/dev/null) == ml4w ]] || exit 0
+
+BACKGROUND="${1:-$(readlink -f "$HOME/.local/state/omarchy/current/background" 2>/dev/null)}"
+
+[[ -f $BACKGROUND ]] || exit 0
+
+mkdir -p "$HOME/.cache/omarchy"
+
+exec 9>"$LOCK_FILE"
+flock 9
+
+TMP_FILE=$(mktemp)
+if ! python3 "$THEME_DIR/bin/derive-colors" "$BACKGROUND" "$TMP_FILE"; then
+  rm -f "$TMP_FILE"
+  log "derive FAILED $BACKGROUND"
+  exit 1
+fi
+
+if cmp -s "$TMP_FILE" "$THEME_DIR/colors.toml"; then
+  rm -f "$TMP_FILE"
+  log "unchanged $BACKGROUND"
+  if ! cmp -s "$THEME_DIR/colors.toml" "$CURRENT_THEME/colors.toml" 2>/dev/null; then
+    log "restaging $BACKGROUND"
+    OMARCHY_ML4W_APPLYING=1 OMARCHY_THEME_SKIP_BACKGROUND=1 omarchy theme set ml4w
+  fi
+  exit 0
+fi
+
+mv "$TMP_FILE" "$THEME_DIR/colors.toml"
+log "updated $BACKGROUND"
+
+OMARCHY_ML4W_APPLYING=1 OMARCHY_THEME_SKIP_BACKGROUND=1 omarchy theme set ml4w

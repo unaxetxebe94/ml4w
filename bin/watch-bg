@@ -1,0 +1,70 @@
+#!/bin/bash
+# Background watcher: re-derives the ML4W palette whenever the wallpaper changes.
+
+set -u
+
+THEME_DIR="$HOME/.config/omarchy/themes/ml4w"
+STATE_DIR="$HOME/.local/state/omarchy"
+PID_FILE="$STATE_DIR/ml4w-watch-bg.pid"
+LOG_FILE="$HOME/.cache/omarchy/ml4w-watch-bg.log"
+
+running() {
+  [[ -f $PID_FILE ]] || return 1
+  local pid
+  pid=$(cat "$PID_FILE" 2>/dev/null)
+  [[ -n $pid ]] || return 1
+  kill -0 "$pid" 2>/dev/null
+}
+
+start() {
+  [[ $(cat "$STATE_DIR/current/theme.name" 2>/dev/null) == ml4w ]] || return 0
+  running && return 0
+
+  mkdir -p "$HOME/.cache/omarchy"
+  : >"$LOG_FILE"
+  nohup bash "$THEME_DIR/bin/watch-bg" run >>"$LOG_FILE" 2>&1 &
+  echo $! >"$PID_FILE"
+}
+
+stop() {
+  if running; then
+    kill "$(cat "$PID_FILE")" 2>/dev/null
+  fi
+  rm -f "$PID_FILE"
+}
+
+run() {
+  echo $$ >"$PID_FILE"
+  trap 'rm -f "$PID_FILE"' EXIT
+
+  local last=""
+  while :; do
+    [[ $(cat "$STATE_DIR/current/theme.name" 2>/dev/null) == ml4w ]] || break
+
+    local background
+    background=$(readlink -f "$STATE_DIR/current/background" 2>/dev/null)
+    if [[ -n $background && -f $background && $background != "$last" ]]; then
+      last=$background
+      "$THEME_DIR/bin/apply-dynamic" "$background"
+    fi
+
+    sleep 1
+  done
+}
+
+case "${1:-start}" in
+  start) start ;;
+  stop) stop ;;
+  run) run ;;
+  status)
+    if running; then
+      echo "running ($(cat "$PID_FILE"))"
+    else
+      echo "stopped"
+    fi
+    ;;
+  *)
+    echo "usage: watch-bg [start|stop|run|status]" >&2
+    exit 2
+    ;;
+esac
