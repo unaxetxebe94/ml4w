@@ -1,6 +1,10 @@
+# Image files
 *.jpg
 *.jpeg
 *.png
 *.tiff
 *.tif
 *.bmp
+
+# Dynamic colors
+colors.toml

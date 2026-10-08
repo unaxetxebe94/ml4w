@@ -2,6 +2,7 @@
 """Write an Omarchy colors.toml derived from a background image."""
 
 import colorsys
+import math
 import re
 import subprocess
 import sys
@@ -14,6 +15,22 @@ ANCHORS = {
     "blue": (0.600, 0.66, 0.70),
     "magenta": (0.880, 0.64, 0.70),
     "orange": (0.075, 0.78, 0.64),
+}
+
+# 0 = anclas ANSI fijas (rojo, verde...), 1 = rueda de matices guiada por la imagen.
+ADAPT = 1.0
+
+# Variación de luminosidad por color cuando la rueda se comprime (imagen casi
+# monocroma), para que los colores sigan siendo distinguibles aunque sus matices
+# queden muy próximos.
+STAGGER = {
+    "red": -0.08,
+    "yellow": 0.12,
+    "orange": 0.02,
+    "green": -0.04,
+    "cyan": 0.06,
+    "blue": -0.12,
+    "magenta": -0.02,
 }
 
 ORDER = [
@@ -45,6 +62,20 @@ ORDER = [
     "bright_magenta",
 ]
 
+# Claves cuya luminosidad se invierte en modo claro.
+INVERT_KEYS = (
+    "background",
+    "dark_background",
+    "darker_background",
+    "lighter_background",
+    "foreground",
+    "dark_foreground",
+    "light_foreground",
+    "bright_foreground",
+    "selection",
+    "muted",
+)
+
 
 def clamp(value, low, high):
     return max(low, min(high, value))
@@ -56,6 +87,7 @@ def hsl(hue, saturation, lightness):
 
 
 def hex_to_hsl(value):
+    value = value.lstrip("#")
     r, g, b = (int(value[i:i + 2], 16) / 255 for i in (0, 2, 4))
     hue, lightness, saturation = colorsys.rgb_to_hls(r, g, b)
     return hue, saturation, lightness
@@ -76,7 +108,7 @@ def histogram(path):
             "-depth",
             "8",
             "-colors",
-            "16",
+            "32",
             "-format",
             "%c",
             "histogram:info:-",
@@ -91,70 +123,141 @@ def histogram(path):
     return entries
 
 
-def pick_source(entries):
+def analyze(entries):
+    """Lista de (share, hue, saturation, lightness) por cluster."""
     total = sum(count for count, _ in entries) or 1
-    best = None
-    best_score = -1.0
-    for count, value in entries:
-        red, green, blue = (int(value[i:i + 2], 16) for i in (0, 2, 4))
-        chroma = (max(red, green, blue) - min(red, green, blue)) / 255
-        score = chroma * (count / total) ** 0.5
+    return [(count / total, *hex_to_hsl(value)) for count, value in entries]
+
+
+def pick_base(items):
+    """Color dominante entre el ~40 % más oscuro de la imagen (para los fondos)."""
+    ordered = sorted(items, key=lambda i: i[3])
+    dark, acc = [], 0.0
+    for item in ordered:
+        dark.append(item)
+        acc += item[0]
+        if acc >= 0.4:
+            break
+    _, h, s, l = max(dark, key=lambda i: i[0])
+    return h, s, l
+
+
+def pick_source(items):
+    """Color más 'vivo' y presente de la imagen (para el accent)."""
+    best, best_score = None, 0.0
+    for share, h, s, l in items:
+        if share < 0.01 or not 0.15 <= l <= 0.88:
+            continue
+        chroma = s * (1 - abs(2 * l - 1))
+        score = chroma * share
         if score > best_score:
-            best_score = score
-            best = value
-    if best is None or best_score < 0.01:
+            best_score, best = score, (h, s, l)
+    if best is None or best_score < 0.002:
         return 0.58, 0.45, 0.55
-    return hex_to_hsl(best)
+    return best
 
 
-def pick_tone(entries):
-    total = sum(count for count, _ in entries) or 1
-    mean_saturation = 0.0
-    mean_lightness = 0.0
-    for count, value in entries:
-        _, saturation, lightness = hex_to_hsl(value)
-        mean_saturation += count * saturation
-        mean_lightness += count * lightness
-    return mean_saturation / total, mean_lightness / total
+def pick_tone(items):
+    saturation = sum(w * s for w, _, s, _ in items)
+    lightness = sum(w * l for w, _, _, l in items)
+    return saturation, lightness
 
 
-def build(hue, saturation, lightness, tone_saturation=None, tone_lightness=None):
-    hue = hue % 1.0
+def hue_stats(items):
+    """Matiz dominante, dispersión (0.3..1) y saturación media de las zonas con color."""
+    pts = [(w * s, h, s) for w, h, s, l in items if s > 0.15 and 0.12 <= l <= 0.92]
+    total = sum(w for w, _, _ in pts)
+    if total < 1e-6:
+        return None
+    x = sum(w * math.cos(2 * math.pi * h) for w, h, _ in pts) / total
+    y = sum(w * math.sin(2 * math.pi * h) for w, h, _ in pts) / total
+    r = clamp(math.hypot(x, y), 1e-3, 1.0)
+    dominant = (math.atan2(y, x) / (2 * math.pi)) % 1.0
+    std = math.sqrt(-2 * math.log(r)) / (2 * math.pi)  # 0 = un solo matiz
+    spread = clamp(std / 0.20, 0.30, 1.0)
+    mean_saturation = sum(w * s for w, _, s in pts) / total
+    return dominant, spread, mean_saturation
+
+
+def pull(target, items, window=0.10, strength=0.7):
+    """Acerca un matiz objetivo al matiz real más cercano y presente en la imagen."""
+    cands = [
+        (w * s / (1 + 8 * abs(hue_delta(h, target))), hue_delta(h, target), s)
+        for w, h, s, l in items
+        if s > 0.2 and 0.15 <= l <= 0.90 and abs(hue_delta(h, target)) < window
+    ]
+    if not cands:
+        return target, None
+    _, delta, sat = max(cands)
+    return target + delta * strength, sat
+
+
+def build(items):
+    base_h, base_s, base_l = pick_base(items)
+    hue, saturation, source_l = pick_source(items)
+    tone_saturation, tone_lightness = pick_tone(items)
+    light = tone_lightness > 0.62
+
     saturation = clamp(saturation, 0.10, 0.90)
-    if tone_saturation is None or tone_lightness is None:
-        tone_saturation, tone_lightness = saturation, lightness
-    background_saturation = clamp(saturation * 0.45, 0.10, 0.30)
-    text_saturation = clamp(saturation * 0.22, 0.06, 0.20)
-    accent_saturation = clamp(0.45 + saturation * 0.35, 0.45, 0.85)
-    accent_lightness = clamp(0.60 + lightness * 0.06, 0.58, 0.68)
-    wheel_shift = clamp(hue_delta(hue, 0.075), -0.15, 0.15)
-    tone_shift = clamp((tone_lightness - 0.45) * 0.35, -0.10, 0.10)
-    tone_saturation_shift = clamp((tone_saturation - 0.40) * 0.40, -0.12, 0.16)
+
+    # Fondos: dependen del color oscuro dominante, no solo del accent.
+    bg_h = base_h
+    bg_s = clamp(base_s * 0.6, 0.05, 0.40)
+    bg_l = clamp(base_l * 0.7, 0.03, 0.16)
+
+    text_s = clamp(bg_s * 0.35, 0.04, 0.16)
+    accent_s = clamp(0.45 + saturation * 0.35, 0.45, 0.85)
+    accent_l = clamp(source_l, 0.50, 0.75)
+
+    dominant, spread, chroma_sat = hue_stats(items) or (hue, 0.35, 0.25)
+    spread = 1 - ADAPT * (1 - spread)
+    tone_shift = clamp((tone_lightness - 0.45) * 0.6, -0.15, 0.15)
+    tone_sat_shift = clamp((tone_saturation - 0.40) * 0.40, -0.12, 0.16)
+
+    fg_l = clamp(bg_l + 0.80, 0.80, 0.95)
 
     palette = {
         "mode": "dark",
-        "accent": hsl(hue, accent_saturation, accent_lightness),
-        "selection": hsl(hue, clamp(saturation * 0.30, 0.10, 0.26), 0.22),
-        "muted": hsl(hue, clamp(saturation * 0.20, 0.06, 0.18), 0.40),
-        "background": hsl(hue, background_saturation, 0.055),
-        "dark_background": hsl(hue, background_saturation * 0.9, 0.042),
-        "darker_background": hsl(hue, background_saturation * 0.8, 0.030),
-        "lighter_background": hsl(hue, background_saturation * 0.8, 0.135),
-        "foreground": hsl(hue, text_saturation, clamp(0.90 + tone_shift * 0.5, 0.86, 0.94)),
-        "dark_foreground": hsl(hue, text_saturation * 0.8, clamp(0.46 + tone_shift, 0.40, 0.56)),
-        "light_foreground": hsl(hue, text_saturation * 0.9, clamp(0.78 + tone_shift, 0.72, 0.86)),
-        "bright_foreground": hsl(hue, text_saturation * 0.8, clamp(0.97 + tone_shift * 0.3, 0.94, 0.99)),
+        "accent": hsl(hue, accent_s, accent_l),
+        "selection": hsl(hue, clamp(saturation * 0.30, 0.10, 0.26), clamp(bg_l + 0.12, 0.16, 0.30)),
+        "muted": hsl(bg_h, clamp(bg_s * 0.6, 0.06, 0.20), 0.40),
+        "background": hsl(bg_h, bg_s, bg_l),
+        "dark_background": hsl(bg_h, bg_s, bg_l * 0.75),
+        "darker_background": hsl(bg_h, bg_s, bg_l * 0.55),
+        "lighter_background": hsl(bg_h, bg_s, bg_l + 0.08),
+        "foreground": hsl(bg_h, text_s, fg_l),
+        "dark_foreground": hsl(bg_h, text_s * 0.8, clamp(0.46 + tone_shift, 0.40, 0.56)),
+        "light_foreground": hsl(bg_h, text_s * 0.9, clamp(fg_l - 0.12, 0.72, 0.86)),
+        "bright_foreground": hsl(bg_h, text_s * 0.8, clamp(fg_l + 0.05, 0.94, 0.99)),
         "brown": hsl(hue + hue_delta(hue, 0.06) * 0.10, 0.45, 0.40),
     }
 
     for name, (anchor, base_saturation, base_lightness) in ANCHORS.items():
-        shifted = (anchor + wheel_shift + hue_delta(hue, anchor) * 0.10) % 1.0
-        color_saturation = clamp(
-            base_saturation + tone_saturation_shift + (saturation - 0.5) * 0.18, 0.45, 0.92
-        )
-        color_lightness = clamp(base_lightness + tone_shift, 0.35, 0.80)
+        # La rueda se comprime alrededor del matiz dominante cuanto más
+        # monocroma sea la imagen; después se acerca a matices reales.
+        target = dominant + hue_delta(anchor, dominant) * spread
+        shifted, img_sat = pull(target, items)
+        shifted %= 1.0
+        mix = 0.5 * ADAPT
+        base_saturation = base_saturation * (1 - mix) + chroma_sat * mix
+        if img_sat is not None:
+            base_saturation = base_saturation * 0.65 + img_sat * 0.35
+        color_saturation = clamp(base_saturation + tone_sat_shift, 0.30, 0.92)
+        stagger = STAGGER[name] * (1 - spread) / 0.7
+        color_lightness = clamp(base_lightness + tone_shift + stagger, 0.35, 0.80)
         palette[name] = hsl(shifted, color_saturation, color_lightness)
         palette["bright_" + name] = hsl(shifted, color_saturation, min(color_lightness + 0.10, 0.84))
+
+    if light:
+        for key in INVERT_KEYS:
+            h, s, l = hex_to_hsl(palette[key])
+            palette[key] = hsl(h, s, 1 - l)
+        for key in list(palette):
+            if key in ANCHORS or key.startswith("bright_") and key != "bright_foreground" \
+                    or key in ("accent", "brown"):
+                h, s, l = hex_to_hsl(palette[key])
+                palette[key] = hsl(h, s, l - 0.18)
+        palette["mode"] = "light"
 
     return palette
 
@@ -165,8 +268,7 @@ def main():
         return 1
 
     image, output = sys.argv[1], sys.argv[2]
-    entries = histogram(image)
-    palette = build(*pick_source(entries), *pick_tone(entries))
+    palette = build(analyze(histogram(image)))
 
     with open(output, "w") as handle:
         for key in ORDER:
