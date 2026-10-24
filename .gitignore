@@ -8,3 +8,11 @@
 
 # Dynamic colors
 colors.toml
+
+# Python files
+__pycache__/    
+.venv
+
+# uv files
+*.uvproj
+uv.lock
